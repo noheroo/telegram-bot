@@ -9,15 +9,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import pro.sky.telegrambot.component.RecordMapper;
 import pro.sky.telegrambot.exception.SendMessageException;
 import pro.sky.telegrambot.model.NotificationTask;
+import pro.sky.telegrambot.record.NotificationTaskRecord;
 import pro.sky.telegrambot.repository.NotificationTaskRepository;
 
 import javax.annotation.PostConstruct;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -32,11 +33,17 @@ public class TelegramBotUpdatesListener implements UpdatesListener {
 
     private final NotificationTaskRepository notificationTaskRepository;
 
+    private final RecordMapper recordMapper;
+
     public TelegramBotUpdatesListener(TelegramBot telegramBot,
-                                      NotificationTaskRepository notificationTaskRepository) {
+                                      NotificationTaskRepository notificationTaskRepository, RecordMapper recordMapper) {
         this.telegramBot = telegramBot;
         this.notificationTaskRepository = notificationTaskRepository;
+        this.recordMapper = recordMapper;
     }
+
+    private final Pattern pattern = Pattern.compile("([\\d\\.\\:\\s]{16})(\\s)([\\W+]+)");
+    private final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
 
     @PostConstruct
     public void init() {
@@ -57,36 +64,42 @@ public class TelegramBotUpdatesListener implements UpdatesListener {
                 sendMessage(sendingText, chatId);
             }
 
-            if (!receivedMessageText.startsWith("/") ) {
-                List<String> parsingMessage = parsingMessage(receivedMessageText, chatId);
-                if (!parsingMessage.isEmpty()) {
-                    addNotificationTask(chatId, parsingMessage);
+            if (!receivedMessageText.startsWith("/")) {
+                NotificationTaskRecord notificationTaskRecord = parseMessage(chatId, receivedMessageText);
+                if (notificationTaskRecordIsChecked(notificationTaskRecord, chatId)) {
+                    addNotificationTask(notificationTaskRecord);
                 }
             }
         });
         return UpdatesListener.CONFIRMED_UPDATES_ALL;
     }
 
-    //Create message for /start command
-    private String createMessageTextForStart(String firstname) {
-        return "Hello my friend " + firstname + ". Send me Notification task. Format example: DD.MM.YYYY HH:MM Notification";
+    private boolean notificationTaskRecordIsChecked(NotificationTaskRecord notificationTaskRecord, Long chatId) {
+        if (notificationTaskRecord.getTextNotification() == null || notificationTaskRecord.getSendingDateTime() == null) {
+            String errorMessage = "You sent message in wrong format";
+            sendMessage(errorMessage, chatId);
+            return false;
+        }
+        return true;
     }
 
-    //parse message by groups
-    private List<String> parsingMessage(String receivedMessageText, Long chatId) {
-        List<String> dividedMessage = new ArrayList<>();
-        String error = "You sent message in wrong format";
-        String patternString = "([\\d\\.\\:\\s]{16})(\\s)([\\W+]+)";
-        Pattern pattern = Pattern.compile(patternString);
+    //Create message for /start command
+    private String createMessageTextForStart(String firstname) {
+        return "Hello my friend " + firstname + ". Send me Notification task. Format example: DD.MM.YYYY HH:MM Text notification";
+    }
+
+    //parse message by groups and create notificationTaskRecord
+    private NotificationTaskRecord parseMessage(Long chatId, String receivedMessageText) {
+        NotificationTaskRecord notificationTaskRecord = new NotificationTaskRecord();
 
         Matcher matcher = pattern.matcher(receivedMessageText);
         if (matcher.find()) {
-            dividedMessage.add(matcher.group(1));
-            dividedMessage.add(matcher.group(3));
-        } else {
-            sendMessage(error, chatId);
+            notificationTaskRecord.setSendingDateTime(LocalDateTime.parse(matcher.group(1), formatter));
+            notificationTaskRecord.setTextNotification(matcher.group(3));
+            notificationTaskRecord.setChatId(chatId);
+            logger.info("Notification task record created");
         }
-        return dividedMessage;
+        return notificationTaskRecord;
     }
 
     //send message with needed text and in needed chat
@@ -96,7 +109,7 @@ public class TelegramBotUpdatesListener implements UpdatesListener {
         if (!response.isOk()) {
             throw new SendMessageException("Send error " + response.errorCode());
         }
-        logger.info("Message {"+ sendingText + "} sent successfully to user id " + chatId);
+        logger.info("Message {" + sendingText + "} sent successfully to user id " + chatId);
     }
     /*This test method I wrote for test dateTimeFormatted
     private String createMessageTextForNotification(NotificationTask notificationTask) {
@@ -106,19 +119,9 @@ public class TelegramBotUpdatesListener implements UpdatesListener {
     */
 
     //Add notification task in DB
-    private void addNotificationTask(Long chatId, List<String> dividedMessage) {
-        NotificationTask newNotificationTask = new NotificationTask();
-        newNotificationTask.setChatId(chatId);
-        newNotificationTask.setTextNotification(dividedMessage.get(1));
-        newNotificationTask.setSendingDateTime(parseDateTimeForEntity(dividedMessage.get(0)));
-        notificationTaskRepository.save(newNotificationTask);
+    private void addNotificationTask(NotificationTaskRecord notificationTaskRecord) {
+        notificationTaskRepository.save(recordMapper.toEntity(notificationTaskRecord));
         logger.info("Notification task created and added successfully");
-    }
-
-    //parse Date and Time for DB
-    private LocalDateTime parseDateTimeForEntity(String DateTime) {
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
-        return LocalDateTime.parse(DateTime, formatter);
     }
 
     // searching and sending actual message every minute
@@ -129,6 +132,8 @@ public class TelegramBotUpdatesListener implements UpdatesListener {
         if (!actualTask.isEmpty()) {
             for (NotificationTask notificationTask : actualTask) {
                 sendMessage(notificationTask.getTextNotification(), notificationTask.getChatId());
+                notificationTaskRepository.delete(notificationTask);
+                logger.info("Notification task deleted successfully");
             }
         }
     }
